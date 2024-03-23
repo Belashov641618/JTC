@@ -26,6 +26,7 @@ class CycleTimePredictor:
         self.StringLength = 0
         self.FullTimePredictions = numpy.zeros(len(IteratingList))
     def __iter__(self):
+        iter(self.IteratingList)
         return self
     def __next__(self):
         self.CurrentIteration += 1

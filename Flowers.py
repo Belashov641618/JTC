@@ -1,11 +1,30 @@
+import matplotlib.pyplot
 import torch
 from torch.utils.data import DataLoader, Dataset
 from torchvision import datasets, transforms
 
-from typing import Union, Type, Literal, Optional
+from typing import Union, Type, Literal, Optional, Tuple, Callable
 
 from CycleTimePredictor import CycleTimePredictor
 from belashovplot import TiledPlot
+from math import sqrt
+from itertools import product
+
+def plot_batch(batch:torch.Tensor, name:str, ratio:float=16/9):
+    amount = batch.size(0)
+    rows = int(sqrt(amount/ratio))
+    cols = amount // rows
+    if cols * rows < amount: cols += 1
+
+    plot = TiledPlot(14, 14/ratio)
+    plot.title(name)
+
+    for image, (col, row) in zip(batch, product(range(cols), range(rows))):
+        image = torch.abs(image.squeeze())
+        axes = plot.axes.add(row, col)
+        axes.imshow(image, aspect='auto', cmap='gray')
+
+    plot.show()
 
 class ConvolutionalCompression(torch.nn.Module):
     _data_train : DataLoader
@@ -47,11 +66,12 @@ class ConvolutionalCompression(torch.nn.Module):
         if core_type == 'phase':
             self._core = torch.nn.Parameter(torch.exp(2j*torch.pi*torch.rand((core_size, core_size), dtype=torch.float32)))
         elif core_type == 'amplitude':
-            self._core = torch.nn.Parameter(torch.rand((core_size, core_size), dtype=torch.complex64))
+            self._core = torch.nn.Parameter(torch.rand((core_size, core_size), dtype=torch.float32).to(torch.complex64))
         else:
             self._core = torch.nn.Parameter(torch.rand((core_size, core_size), dtype=torch.complex64)*torch.exp(2j*torch.pi*torch.rand((core_size, core_size), dtype=torch.float32)))
         # temp = torch.zeros((core_size, core_size), dtype=torch.complex64)
         # temp[int(core_size / 2), int(core_size / 2)] = 1.0
+        # temp[0, 0] = 0.5
         # self._core = torch.nn.Parameter(temp)
 
         self._size = size
@@ -61,76 +81,90 @@ class ConvolutionalCompression(torch.nn.Module):
 
         self._compression_level = compression
         self._convolution_type = convolution
+        self._fourier_padding = True
 
     _size:int
-    @property
-    def _data_paddings(self):
-        right_top = int(self._size / 2)
-        left_bottom = int(self._size / 2)
-        return left_bottom, right_top, right_top, left_bottom
-
     _core_size:int
-    @property
-    def _core_padding(self):
-        return int((self._core_size + 1) // 2)
-    @property
-    def _core_paddings(self):
-        left_bottom:int = int((self._size  + 2*self._core_padding - self._core_size) / 2)
-        right_top:int = int((self._size + 2*self._core_padding - self._core_size + 1) // 2)
-        return left_bottom, right_top, right_top, left_bottom
-    @property
-    def _core_padding_to_size(self):
-        left_bottom: int = int((self._size - self._core_size) / 2)
-        right_top: int = int((self._size - self._core_size + 1) // 2)
-        return left_bottom, right_top, right_top, left_bottom
-
     _compression_level:float
     @property
     def _compressed_size(self):
-        return int(self._size*self._compression_level)
+        return int(self._size*sqrt(self._compression_level))
+
+    _fourier_padding:bool
+
     @property
-    def _compression_padding(self):
-        return int((self._size - self._compressed_size + 1) // 2)
-    @property
-    def _compression_paddings(self):
-        left_bottom = int((self._size - self._compressed_size) / 2)
-        right_top = int((self._size - self._compressed_size + 1) // 2)
-        return left_bottom, right_top, left_bottom, right_top
+    def _compressed_frame(self):
+        padding = (self._size - self._compressed_size) // 2
+        return padding, padding+self._compressed_size, padding, padding+self._compressed_size
+
+    @staticmethod
+    def fix_shape(a:torch.Tensor):
+        while len(a.size()) != 4: a = a.unsqueeze(0)
+        return a
+    @staticmethod
+    def pad_to_same_size(a:torch.Tensor, b:torch.Tensor):
+        a = ConvolutionalCompression.fix_shape(a)
+        b = ConvolutionalCompression.fix_shape(b)
+
+        a_paddings = [0 for i in range(4)]
+        b_paddings = [0 for i in range(4)]
+
+        for i in range(2):
+            n = i + 2
+            if a.size(2) >= b.size(2):
+                b_paddings[2*i + 0] = (a.size(n) - b.size(n)) // 2
+                b_paddings[2*i + 1] = a.size(n) - b.size(n) - b_paddings[0]
+            else:
+                a_paddings[2*i + 0] = (b.size(n) - a.size(n)) // 2
+                a_paddings[2*i + 1] = b.size(n) - a.size(n) - a_paddings[0]
+
+        a_frame = (a_paddings[0], a_paddings[0] + a.size(2), a_paddings[2], a_paddings[2] + a.size(3))
+        b_frame = (b_paddings[0], b_paddings[0] + b.size(2), b_paddings[2], b_paddings[2] + b.size(3))
+
+        if sum(a_paddings) > 0: a = torch.nn.functional.pad(a, pad=a_paddings)
+        if sum(b_paddings) > 0: b = torch.nn.functional.pad(b, pad=b_paddings)
+
+        return a, b, a_frame, b_frame
+    @staticmethod
+    def un_pad_from_frame(a:torch.Tensor, a_frame:Tuple[int,int,int,int]):
+        a = ConvolutionalCompression.fix_shape(a)
+        return a[:,:,a_frame[0]:a_frame[1],a_frame[2]:a_frame[3]]
+    @staticmethod
+    def pad_to_size(a:torch.Tensor, size:int):
+        a = ConvolutionalCompression.fix_shape(a)
+        left = (size - a.size(2)) // 2
+        right = size - a.size(2) - left
+        top = (size - a.size(3)) // 2
+        bottom = size - a.size(3) - top
+        if left + top > 0: a = torch.nn.functional.pad(a, pad=(left,right, top,bottom))
+        a_frame = (left, left+a.size(2), top, top+a.size(3))
+        return a, a_frame
 
     @staticmethod
     def _randomize_phase(data:torch.Tensor):
         return data * torch.exp(2j*torch.pi*torch.rand(data.size(), dtype=torch.float32))
 
     _convolution_type:str
+    def _convolution(self, data:torch.Tensor, core:torch.Tensor):
+        if self._convolution_type == 'fourier':
+            core, data, core_frame, data_frame = self.pad_to_same_size(core, data)
+            core_spectrum = torch.fft.fftshift(torch.fft.fft2(core))
+            data_spectrum = torch.fft.fftshift(torch.fft.fft2(data))
+            convolution = torch.fft.ifftshift(torch.fft.ifft2(data_spectrum*core_spectrum))
+            convolution = self.un_pad_from_frame(convolution, data_frame)
+            return convolution
+        elif self._convolution_type == 'convolution':
+            return None
+
     def compress(self, data:torch.Tensor):
         data = self._randomize_phase(data)
-        convolution:Optional[torch.Tensor] = None
-        if self._convolution_type == 'fourier':
-            padded_data = torch.nn.functional.pad(data, pad=[self._core_padding]*4)
-            padded_core = torch.nn.functional.pad(self._core, pad=self._core_paddings)
-            padded_data_spectrum = torch.fft.fftshift(torch.fft.fft2(padded_data))
-            padded_core_spectrum = torch.fft.fftshift(torch.fft.fft2(padded_core))
-            multiplication = padded_core_spectrum * padded_data_spectrum
-            convolution = torch.fft.ifftshift(torch.fft.ifft2(multiplication))[:,:,self._core_padding:self._core_padding+self._size,self._core_padding:self._core_padding+self._size]
-        elif self._convolution_type == 'convolution':
-            padded_data = torch.nn.functional.pad(data, pad=self._data_paddings)
-            convolution = torch.nn.functional.conv2d(padded_data, self._core.reshape(1,1,*self._core.size()))
-        compressed:torch.Tensor = convolution[:,:,self._compression_padding:self._compression_padding+self._compressed_size,self._compression_padding:self._compression_padding+self._compressed_size]
+        convolution = self._convolution(data, self._core)
+        compressed = self.un_pad_from_frame(convolution, self._compressed_frame)
         return compressed
-    def decompress(self, data:torch.Tensor):
-        result:Optional[torch.Tensor] = None
-        padded_data = torch.nn.functional.pad(data, pad=self._compression_paddings)
-        if self._convolution_type == 'fourier':
-            padded_core = torch.nn.functional.pad(self._core, pad=self._core_padding_to_size)
-            padded_data_spectrum = torch.fft.fftshift(torch.fft.fft2(padded_data))
-            padded_core_spectrum = torch.fft.fftshift(torch.fft.fft2(padded_core))
-            multiplication = padded_core_spectrum * padded_data_spectrum
-            result = torch.fft.ifftshift(torch.fft.ifft2(multiplication))
-        elif self._convolution_type == 'convolution':
-            padded_data = torch.nn.functional.pad(padded_data, pad=self._data_paddings)
-            convolution = torch.nn.functional.conv2d(padded_data, self._core.reshape(1,1,*self._core.size()))
-            result = convolution[:,:,self._compression_padding:self._compression_padding+self._compressed_size,self._compression_padding:self._compression_padding+self._compressed_size]
-        return result
+    def decompress(self, compressed:torch.Tensor):
+        compressed, compressed_frame = self.pad_to_size(compressed, self._size)
+        decompressed = self._convolution(compressed, self._decompression_core)
+        return decompressed
     def test(self, samples:int=3):
         with torch.no_grad():
             images, labels = next(iter(self._data_test))
@@ -142,18 +176,26 @@ class ConvolutionalCompression(torch.nn.Module):
         plot.title("Исходное изображение, сжатое и восстановленное")
         plot.description.top(f'Уровень сжатия: {int(self._compression_level*100)}%, Размер входного изображения {self._size} на {self._size} пикселей.')
 
-        plot.description.column.top('Исходное', 0)
-        plot.description.column.top('Сжатое', 1)
-        plot.description.column.top('Восстановленное', 2)
+        plot.description.row.right('Исходное', 0)
+        plot.description.row.right('Сжатое', 1)
+        plot.description.row.right('Восстановленное', 2)
 
-        for row, (image, compressed, decompressed) in enumerate(zip(images, compressed_list, decompressed_list)):
-            axes = plot.axes.add(0, row)
+        axes = plot.axes.add(0, 0)
+        plot.graph.description('Ядро сжатия')
+        axes.imshow(torch.abs(self._core.detach()), aspect='auto', cmap='viridis')
+
+        axes = plot.axes.add(0, 2)
+        plot.graph.description('Ядро расшифровки')
+        axes.imshow(torch.abs(self._decompression_core.detach()), aspect='auto', cmap='viridis')
+
+        for col, (image, compressed, decompressed) in enumerate(zip(images, compressed_list, decompressed_list), start=1):
+            axes = plot.axes.add(col, 0)
             axes.imshow(image.abs().squeeze(), aspect='auto', cmap='gray')
 
-            axes = plot.axes.add(1, row)
+            axes = plot.axes.add(col, 1)
             axes.imshow(compressed.abs().squeeze(), aspect='auto', cmap='gray')
 
-            axes = plot.axes.add(2, row)
+            axes = plot.axes.add(col, 2)
             axes.imshow(decompressed.abs().squeeze(), aspect='auto', cmap='gray')
 
         plot.show()
@@ -162,15 +204,52 @@ class ConvolutionalCompression(torch.nn.Module):
     @property
     def _decompression_core(self):
         if self._convolution_type == 'fourier':
-            pass
+            return torch.fft.ifft2(1.0 / torch.fft.fftshift(torch.fft.fft2(self._core)))
         elif self._convolution_type == 'convolution':
             raise Exception('На данный момент существующий алгоритм пиздец какой сложный https://www.notion.so/4da066e852174b1b94401e818a973bd4?pvs=4#076f6fbba3c6415684149472f0860cb4')
+    @property
+    def core(self):
+        class Selector:
+            _self : ConvolutionalCompression
+            def __init__(self, _self:ConvolutionalCompression):
+                self._self = _self
+            @property
+            def compression(self):
+                return self._self._core.clone().detach().cpu()
+            @property
+            def decompression(self):
+                return self._self._decompression_core.clone().detach().cpu()
+        return Selector(self)
 
     def forward(self, data:torch.Tensor):
+        return self.decompress(self.compress(data))
+
+    def _epoch(self, loss_function:Callable):
+        for batch, (images, labels) in enumerate(CycleTimePredictor(self._data_train)):
+            if not isinstance(images, torch.Tensor):
+                raise Exception
+            decompressed = self.forward(images)
+            loss =
+
 
         pass
+    def _accuracy(self):
+        pass
+    def train(self, epochs:int=1, loss_function:Union[Callable,Literal['MSE']]= 'MSE'):
+        if isinstance(loss_function, str):
+            if loss_function == 'MSE':
+                loss_function = torch.nn.MSELoss()
+            else:
+                loss_function = torch.nn.MSELoss()
+        for epoch in range(epochs):
+            self.train()
+            self._epoch(loss_function)
+            self.eval()
+            self._accuracy()
 
 
 if __name__ == '__main__':
-    Compressor = ConvolutionalCompression('Flowers', size=81, compression=0.9, convolution='convolution')
+
+    Compressor = ConvolutionalCompression('Flowers', size=255, compression=0.95, convolution='fourier', core_ratio=1.0, core_type='combat')
     Compressor.test()
+
