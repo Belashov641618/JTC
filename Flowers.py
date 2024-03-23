@@ -229,7 +229,6 @@ class ConvolutionalCompression(torch.nn.Module):
             if not isinstance(images, torch.Tensor):
                 raise Exception
             decompressed = self.forward(images)
-            loss =
 
 
         pass
