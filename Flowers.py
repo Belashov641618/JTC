@@ -1,3 +1,6 @@
+import copy
+import random
+
 import matplotlib.pyplot
 import torch
 from torch.utils.data import DataLoader, Dataset
@@ -10,6 +13,7 @@ from belashovplot import TiledPlot
 from math import sqrt
 from itertools import product
 from Formaters import Format
+import numpy
 
 def plot_batch(batch:torch.Tensor, name:str, ratio:float=16/9):
     amount = batch.size(0)
@@ -30,6 +34,31 @@ def plot_batch(batch:torch.Tensor, name:str, ratio:float=16/9):
 class ConvolutionalCompression(torch.nn.Module):
     _data_train : DataLoader
     _data_test  : DataLoader
+    def get_images(self, count:int, test:bool=True):
+        data = None
+        if test:    data = self._data_test
+        else:       data = self._data_train
+        data = iter(data)
+
+        images, labels = next(data)
+        if images.size(0) > count:
+            images_ = images[:count, :,:,:]
+            count = 0
+        else:
+            images_ = images
+            count -= images.size(0)
+
+        while count > 0:
+            images, labels = next(data)
+            if images.size(0) > count:
+                images_ = torch.cat((images_, images[:count, :, :, :]), dim=0)
+                count = 0
+            else:
+                images_ = torch.cat((images_, images), dim=0)
+                count -= images.size(0)
+
+        images_ = images_.to(self.device)
+        return images_
 
     @property
     def device(self):
@@ -87,6 +116,7 @@ class ConvolutionalCompression(torch.nn.Module):
         self._compression_level = compression
         self._convolution_type = convolution
         self._fourier_padding = True
+        self._accuracy = None
 
     _size:int
     _core_size:int
@@ -209,20 +239,14 @@ class ConvolutionalCompression(torch.nn.Module):
 
         plot.show()
 
-    __core:torch.nn.Parameter
+    _compression_core:torch.nn.Parameter
     @property
     def _core(self):
-        return (1.0 / (1.0 + torch.exp(-torch.abs(self.__core)))) * torch.exp(1j*torch.angle(self.__core))
+        return (1.0 / (1.0 + torch.exp(-torch.abs(self._compression_core)))) * torch.exp(1j * torch.angle(self._compression_core))
     @_core.setter
     def _core(self, data:torch.Tensor):
-        self.__core = torch.nn.Parameter((-torch.log(1.0 / data - 1.0))*torch.exp(1j*torch.angle(data)))
+        self._compression_core = torch.nn.Parameter((-torch.log(1.0 / data - 1.0)) * torch.exp(1j * torch.angle(data)))
     _decompression_core:torch.nn.Parameter
-    # @property
-    # def _decompression_core(self):
-    #     if self._convolution_type == 'fourier':
-    #         return torch.fft.ifft2(1.0 / torch.fft.fftshift(torch.fft.fft2(self._core)))
-    #     elif self._convolution_type == 'convolution':
-    #         raise Exception('На данный момент существующий алгоритм пиздец какой сложный https://www.notion.so/4da066e852174b1b94401e818a973bd4?pvs=4#076f6fbba3c6415684149472f0860cb4')
     @property
     def core(self):
         class Selector:
@@ -235,6 +259,20 @@ class ConvolutionalCompression(torch.nn.Module):
             @property
             def decompression(self):
                 return self._self._decompression_core.clone().detach().cpu()
+        return Selector(self)
+
+    @property
+    def params(self):
+        class Selector:
+            _self : ConvolutionalCompression
+            def __init__(self, _self:ConvolutionalCompression):
+                self._self = _self
+            @property
+            def compression(self):
+                return self._self._compression_core
+            @property
+            def decompression(self):
+                return self._self._decompression_core
         return Selector(self)
 
     def forward(self, data:torch.Tensor):
@@ -271,7 +309,12 @@ class ConvolutionalCompression(torch.nn.Module):
         b = b - torch.mean(b, dim=(2,3), keepdim=True)
         return (1.0 - torch.sum(a*b,dim=(2,3)) / torch.sqrt(torch.sum(a*a, dim=(2,3))*torch.sum(b*b, dim=(2,3))))**2
 
+    _accuracy:Optional[float]
     def _epoch(self, comparison_function:Callable, loss_function:Callable, optimizer:torch.optim.Optimizer):
+        self._accuracy = None
+
+        loss_history = []
+
         loss_buffer_size = 10
         loss_buffer_position = 0
         loss_buffer = [0 for i in range(loss_buffer_size)]
@@ -280,6 +323,7 @@ class ConvolutionalCompression(torch.nn.Module):
         def show_average_loss():
             return f'Средний лосс за {loss_buffer_size} операций: {Format.Scientific(sum(loss_buffer)/loss_buffer_size, "", 2)}'
 
+        self.train()
         for batch, (images, labels) in enumerate(CycleTimePredictor(self._data_train, [show_loss, show_average_loss])):
             if not isinstance(images, torch.Tensor):
                 raise Exception
@@ -294,40 +338,35 @@ class ConvolutionalCompression(torch.nn.Module):
             loss.backward()
             optimizer.step()
 
-            # prev_loss = loss_buffer[loss_buffer_position]
             loss_buffer_position = loss_buffer_position + 1 if loss_buffer_position < loss_buffer_size - 1 else 0
             loss_buffer[loss_buffer_position] = loss.item()
-            # curr_loss = loss_buffer[loss_buffer_position]
 
-            # if curr_loss > prev_loss:
-            #     for param_group in optimizer.param_groups:
-            #         param_group['lr'] *= 0.5
-            # else:
-            #     for param_group in optimizer.param_groups:
-            #         param_group['lr'] *= 1.1
+            loss_history.append(loss_buffer[loss_buffer_position])
+        self.eval()
 
+        return loss_history
+    def accuracy(self, comparison_function:Callable, loss_function:Callable):
+        if self._accuracy is None:
+            with torch.no_grad():
+                average_loss = 0.0
+                counter:int = 0
+                def show_average_loss():
+                    return f'Средний лосс: {Format.Scientific(average_loss / (counter if counter > 0 else 1), "", 2)}'
+                for batch, (images, labels) in enumerate(CycleTimePredictor(self._data_test, [show_average_loss])):
+                    if not isinstance(images, torch.Tensor):
+                        raise Exception
+                    images = images.to(self.device)
+                    decompressed = self.forward(images)
+                    images = images.abs()
+                    decompressed = decompressed.abs()
+                    deviations = comparison_function(images, decompressed)
+                    loss = loss_function(deviations)
 
-    def _accuracy(self, comparison_function:Callable, loss_function:Callable):
-        with torch.no_grad():
-            average_loss = 0.0
-            counter:int = 0
-            def show_average_loss():
-                return f'Средний лосс: {Format.Scientific(average_loss / (counter if counter > 0 else 1), "", 2)}'
-            for batch, (images, labels) in enumerate(CycleTimePredictor(self._data_test, [show_average_loss])):
-                if not isinstance(images, torch.Tensor):
-                    raise Exception
-                images = images.to(self.device)
-                decompressed = self.forward(images)
-                # images = self._normalize(images.abs())
-                # decompressed = self._normalize(decompressed.abs())
-                images = images.abs()
-                decompressed = decompressed.abs()
-                deviations = comparison_function(images, decompressed)
-                loss = loss_function(deviations)
-
-                average_loss += loss.item()
-                counter += 1
-    def optimize(self, epochs:int=1, loss_function:Union[Callable,Literal['Mean']]='Mean', comparison_function:Union[Callable,Literal['MSD', 'MSDR', 'Max', 'MaxR', 'RPSNR', 'RSCC']]='MSD', optimizer:type(torch.optim.Optimizer)=None, **optimizer_kwargs):
+                    average_loss += loss.item()
+                    counter += 1
+                self._accuracy = average_loss / counter
+        return self._accuracy
+    def optimize(self, optimizer:torch.optim.Optimizer, epochs:int=1, loss_function:Union[Callable,Literal['Mean']]='Mean', comparison_function:Union[Callable,Literal['MSD', 'MSDR', 'Max', 'MaxR', 'RPSNR', 'RSCC']]='MSD'):
         if isinstance(loss_function, str):
             if loss_function == 'Mean':
                 loss_function = torch.mean
@@ -348,33 +387,139 @@ class ConvolutionalCompression(torch.nn.Module):
                 comparison_function = self.reversed_square_cross_correlation
             else:
                 comparison_function = self.mean_square_deviation
-        if optimizer is None:
-            optimizer = torch.optim.Adam
-            optimizer_kwargs = {
-                'lr': 0.01,
-            }
-        optimizer = optimizer(params=self.parameters(), **optimizer_kwargs)
 
-        self._accuracy(comparison_function, loss_function)
+        optimization_info = OptimizationHistory()
+
+        self.accuracy(comparison_function, loss_function)
         for epoch in range(epochs):
-            self.train()
-            self._epoch(comparison_function, loss_function, optimizer)
-            self.eval()
-            self._accuracy(comparison_function, loss_function)
+            loss_history = self._epoch(comparison_function, loss_function, optimizer)
+            accuracy = self.accuracy(comparison_function, loss_function)
+            optimization_info.append(loss_history, accuracy, self)
 
+        return optimization_info
+
+class OptimizationHistory:
+    _epochs_loss_histories:list[numpy.ndarray]
+    _epochs_accuracy:list[float]
+    _epochs_networks:list[ConvolutionalCompression]
+
+    def __init__(self):
+        self._epochs_loss_histories = []
+        self._epochs_accuracy = []
+        self._epochs_networks = []
+
+    def append_loss_history(self, loss_history:Union[numpy.ndarray, list[float]], epoch:int=None):
+        if isinstance(loss_history, list):
+            loss_history = numpy.array(loss_history)
+        if epoch is None or len(self._epochs_loss_histories) <= epoch:
+            self._epochs_loss_histories.append(loss_history)
+        else:
+            self._epochs_loss_histories[epoch] = loss_history
+    def append_accuracy(self, accuracy:float, epoch:int=None):
+        if epoch is None or len(self._epochs_accuracy) <= epoch:
+            self._epochs_accuracy.append(accuracy)
+        else:
+            self._epochs_accuracy[epoch] = accuracy
+    def append_network(self, network:ConvolutionalCompression, epoch:int=None):
+        if epoch is None or len(self._epochs_accuracy) <= epoch:
+            self._epochs_networks.append(copy.deepcopy(network))
+        else:
+            self._epochs_networks[epoch] = copy.deepcopy(network)
+    def append(self, loss_history:Union[numpy.ndarray, list[float]], accuracy:float, network:ConvolutionalCompression):
+        self.append_network(network)
+        self.append_accuracy(accuracy)
+        self.append_loss_history(loss_history)
+    @property
+    def length(self):
+        return len(self._epochs_networks)
+
+    def __sub__(self, other):
+        if isinstance(other, OptimizationHistory):
+            temp = OptimizationHistory()
+            temp._epochs_loss_histories = self._epochs_loss_histories + other._epochs_loss_histories
+            temp._epochs_accuracy       = self._epochs_accuracy       + other._epochs_accuracy
+            temp._epochs_networks       = self._epochs_networks       + other._epochs_networks
+            return temp
+        else: raise TypeError
+
+    def plot(self, images:torch.Tensor, additional_information:str=None):
+        with torch.no_grad():
+            epochs_reconstructs:list[torch.Tensor] = []
+            for network in self._epochs_networks:
+                epochs_reconstructs.append(network.forward(images))
+
+        plot = TiledPlot(11.7*1.5, 8.3*1.5)
+        plot.title('Подробная история обучения нейронной сети')
+        if additional_information is not None:
+            plot.description.bottom(additional_information)
+        plot.FontLibrary.MultiplyFontSize(0.7)
+
+        image_params = {'aspect':'auto', 'cmap':'gray'}
+        def image_function(image_:torch.Tensor):
+            return torch.abs(image_).squeeze().cpu()
+
+        def add_image(image_:torch.Tensor, col:int, row:int):
+            axes = plot.axes.add(col, row)
+            axes.imshow(image_function(image_), **image_params)
+
+        colors = ['maroon', 'darkorange', 'darkgreen', 'darkslategrey', 'darkblue', 'darkslateblue', 'darkviolet', 'darkmagenta']*(self.length//8 + 1)
+        axes = plot.axes.add((1, 0), (self.length, 0))
+        axes.grid(True)
+        prev_iters = 0
+        for color, loss_history in zip(colors, self._epochs_loss_histories):
+            iters = numpy.arange(prev_iters+1, prev_iters+loss_history.shape[0]+1)
+            prev_iters = iters[-1]
+            axes.plot(iters, loss_history, color=color, linewidth=1.0, linestyle='--')
+        axes.set_xlim(1, prev_iters)
+        plot.title('График лосс-функции')
+        plot.graph.label.x('Номер итерации')
+        plot.graph.label.y('Лосс')
+
+        axes = plot.axes.add(0, 0)
+        axes.grid(True)
+        axes.plot(range(1, len(self._epochs_accuracy)+1), self._epochs_accuracy, color='purple', linewidth=1.0, linestyle='--', marker='.')
+        plot.title('График точности')
+        plot.graph.label.x('Номер эпохи')
+        plot.graph.label.y('Точность')
+
+        for row, image in enumerate(images, start=1):
+            add_image(image, 0, row)
+            plot.description.row.left(f"Пример №{row}", row)
+        row_cc = 1 + len(images)
+        row_dc = row_cc + 1
+        plot.description.row.right('Ядро шифрования', row_cc)
+        plot.description.row.right('Ядро дешифрования', row_dc)
+        plot.description.row.right('Дешифрованные сжатые изображения', 1, len(images))
+
+        for col, (reconstructions, network) in enumerate(zip(epochs_reconstructs, self._epochs_networks), start=1):
+            plot.description.column.top(f"Эпоха №{col}", col)
+            for row, decompressed in enumerate(reconstructions, start=1):
+                add_image(decompressed, col, row)
+            axes = plot.axes.add(col, row_cc)
+            axes.imshow(torch.abs(network.core.compression), aspect='auto', cmap='viridis')
+            axes = plot.axes.add(col, row_dc)
+            axes.imshow(torch.abs(network.core.decompression), aspect='auto', cmap='viridis')
+
+        plot.show()
 
 if __name__ == '__main__':
-    Compressor = ConvolutionalCompression('Flowers', batch=404, size=511, compression=0.1, core_ratio=1.0, core_type='phase')
-    Compressor.test()
+    # Compressor = ConvolutionalCompression('Flowers', batch=404, size=511, compression=0.1, core_ratio=1.0, core_type='phase')
+    # Compressor.test()
 
-    rate = 0.01
-    while True:
-        print(f'Rate: {Format.Scientific(rate, "", 2)}')
-        Compressor.optimize(optimizer=torch.optim.Adam, lr=rate, amsgrad=True, epochs=3, comparison_function='MSD')
-        Compressor.test()
-        Compressor.optimize(optimizer=torch.optim.Adam, lr=rate, amsgrad=True, epochs=3, comparison_function='MSD')
-        Compressor.test()
-        Compressor.optimize(optimizer=torch.optim.Adam, lr=rate, amsgrad=True, epochs=3, comparison_function='MSD')
-        Compressor.test()
-        rate /= 2
+    compression_core_rates =    numpy.logspace(0, -9, 10, base=10)
+    decompression_core_rates =  numpy.logspace(0, -9, 10, base=10)
 
+    accuracies = []
+
+    for (n, compression_core_rate), (m, decompression_core_rate) in product(enumerate(compression_core_rates), enumerate(decompression_core_rates)):
+        compressor = ConvolutionalCompression('Flowers', batch=404, size=511, compression=0.1)
+        compression_group   = {'params':compressor.params.compression,   'lr':compression_core_rate}
+        decompression_group = {'params':compressor.params.decompression, 'lr':decompression_core_rate}
+        optimizer = torch.optim.Adam([compression_group, decompression_group])
+
+        info = compressor.optimize(optimizer, epochs=10, comparison_function='RSCC')
+        info.plot(compressor.get_images(3), f"Скорость обучения ядра шифровки: {Format.Scientific(compression_core_rate, '', 3)}\nСкорость обучения ядра дешифровки: {Format.Scientific(decompression_core_rate, '', 3)}")
+
+        accuracies.append(compressor._accuracy)
+
+    print(accuracies)
