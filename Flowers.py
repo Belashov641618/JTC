@@ -267,8 +267,8 @@ class ConvolutionalCompression(torch.nn.Module):
         return 1.0 / (10 * torch.log10(1.0 / torch.nn.functional.mse_loss(a, b) + 1.0))
     @staticmethod
     def reversed_square_cross_correlation(a:torch.Tensor, b:torch.Tensor):
-        a = a - torch.mean(a, dim=(2,3)).expand(*a.size())
-        b = b - torch.mean(b, dim=(2,3)).expand(*b.size())
+        a = a - torch.mean(a, dim=(2,3), keepdim=True)
+        b = b - torch.mean(b, dim=(2,3), keepdim=True)
         return (1.0 - torch.sum(a*b,dim=(2,3)) / torch.sqrt(torch.sum(a*a, dim=(2,3))*torch.sum(b*b, dim=(2,3))))**2
 
     def _epoch(self, comparison_function:Callable, loss_function:Callable, optimizer:torch.optim.Optimizer):
