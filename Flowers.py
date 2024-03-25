@@ -69,11 +69,11 @@ class ConvolutionalCompression(torch.nn.Module):
 
         core_size = int(size*core_ratio)
         if core_type == 'phase':
-            self._core = torch.nn.Parameter(torch.exp(2j*torch.pi*torch.rand((core_size, core_size), dtype=torch.float32)))
+            self._core = torch.exp(2j*torch.pi*torch.rand((core_size, core_size), dtype=torch.float32))
         elif core_type == 'amplitude':
-            self._core = torch.nn.Parameter(torch.rand((core_size, core_size), dtype=torch.float32).to(torch.complex64))
+            self._core = torch.rand((core_size, core_size), dtype=torch.float32).to(torch.complex64)
         else:
-            self._core = torch.nn.Parameter(torch.rand((core_size, core_size), dtype=torch.complex64)*torch.exp(2j*torch.pi*torch.rand((core_size, core_size), dtype=torch.float32)))
+            self._core = torch.rand((core_size, core_size), dtype=torch.complex64)*torch.exp(2j*torch.pi*torch.rand((core_size, core_size), dtype=torch.float32))
         # temp = torch.zeros((core_size, core_size), dtype=torch.complex64)
         # temp[int(core_size / 2), int(core_size / 2)] = 1.0
         # self._core = torch.nn.Parameter(temp)
@@ -209,7 +209,13 @@ class ConvolutionalCompression(torch.nn.Module):
 
         plot.show()
 
-    _core:torch.nn.Parameter
+    __core:torch.nn.Parameter
+    @property
+    def _core(self):
+        return (1.0 / (1.0 + torch.exp(-torch.abs(self.__core)))) * torch.exp(1j*torch.angle(self.__core))
+    @_core.setter
+    def _core(self, data:torch.Tensor):
+        self.__core = torch.nn.Parameter((-torch.log(1.0 / data - 1.0))*torch.exp(1j*torch.angle(data)))
     _decompression_core:torch.nn.Parameter
     # @property
     # def _decompression_core(self):
