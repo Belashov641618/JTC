@@ -9,6 +9,7 @@ from CycleTimePredictor import CycleTimePredictor
 from belashovplot import TiledPlot
 from math import sqrt
 from itertools import product
+from Formaters import Format
 
 def plot_batch(batch:torch.Tensor, name:str, ratio:float=16/9):
     amount = batch.size(0)
@@ -30,11 +31,15 @@ class ConvolutionalCompression(torch.nn.Module):
     _data_train : DataLoader
     _data_test  : DataLoader
 
-    def __init__(self, dataset:str, size:int=101, batch:int=64, core_ratio:float=1.0, core_type:Literal['phase','amplitude','combat']='combat', compression:float=0.7, convolution:Literal['fourier', 'convolution']='convolution'):
+    @property
+    def device(self):
+        return self._core.device
+
+    def __init__(self, dataset:str, size:int=101, batch:int=64, core_ratio:float=1.0, core_type:Literal['phase','amplitude','combat']='combat', compression:float=0.7, convolution:Literal['fourier', 'convolution']='fourier'):
         super().__init__()
 
         redirections = {
-            "Flowers" : (datasets.Flowers102, 'split', ['train', 'test'], {
+            "Flowers" : (datasets.Flowers102, 'split', ['test', 'train'], {
                 'root':'data',
                 'download':True,
                 'transform': transforms.Compose([
@@ -71,8 +76,8 @@ class ConvolutionalCompression(torch.nn.Module):
             self._core = torch.nn.Parameter(torch.rand((core_size, core_size), dtype=torch.complex64)*torch.exp(2j*torch.pi*torch.rand((core_size, core_size), dtype=torch.float32)))
         # temp = torch.zeros((core_size, core_size), dtype=torch.complex64)
         # temp[int(core_size / 2), int(core_size / 2)] = 1.0
-        # temp[0, 0] = 0.5
         # self._core = torch.nn.Parameter(temp)
+        self._decompression_core = torch.nn.Parameter(torch.fft.ifft2(1.0 / torch.fft.fftshift(torch.fft.fft2(self._core.clone()))))
 
         self._size = size
         self._core_size = size
@@ -142,7 +147,7 @@ class ConvolutionalCompression(torch.nn.Module):
 
     @staticmethod
     def _randomize_phase(data:torch.Tensor):
-        return data * torch.exp(2j*torch.pi*torch.rand(data.size(), dtype=torch.float32))
+        return data * torch.exp(2j*torch.pi*torch.rand(data.size(), dtype=torch.float32, device=data.device))
 
     _convolution_type:str
     def _convolution(self, data:torch.Tensor, core:torch.Tensor):
@@ -157,7 +162,7 @@ class ConvolutionalCompression(torch.nn.Module):
             return None
 
     def compress(self, data:torch.Tensor):
-        data = self._randomize_phase(data)
+        # data = self._randomize_phase(data)
         convolution = self._convolution(data, self._core)
         compressed = self.un_pad_from_frame(convolution, self._compressed_frame)
         return compressed
@@ -168,9 +173,13 @@ class ConvolutionalCompression(torch.nn.Module):
     def test(self, samples:int=3):
         with torch.no_grad():
             images, labels = next(iter(self._data_test))
-            images = images[:samples]
+            images = images[:samples].to(self.device)
             compressed_list = self.compress(images)
             decompressed_list = self.decompress(compressed_list)
+
+            images = images.cpu()
+            compressed_list = compressed_list.cpu()
+            decompressed_list = decompressed_list.cpu()
 
         plot = TiledPlot(14, 14*9/16)
         plot.title("Исходное изображение, сжатое и восстановленное")
@@ -182,11 +191,11 @@ class ConvolutionalCompression(torch.nn.Module):
 
         axes = plot.axes.add(0, 0)
         plot.graph.description('Ядро сжатия')
-        axes.imshow(torch.abs(self._core.detach()), aspect='auto', cmap='viridis')
+        axes.imshow(torch.abs(self._core.detach()).cpu(), aspect='auto', cmap='viridis')
 
         axes = plot.axes.add(0, 2)
         plot.graph.description('Ядро расшифровки')
-        axes.imshow(torch.abs(self._decompression_core.detach()), aspect='auto', cmap='viridis')
+        axes.imshow(torch.abs(self._decompression_core.detach()).cpu(), aspect='auto', cmap='viridis')
 
         for col, (image, compressed, decompressed) in enumerate(zip(images, compressed_list, decompressed_list), start=1):
             axes = plot.axes.add(col, 0)
@@ -201,12 +210,13 @@ class ConvolutionalCompression(torch.nn.Module):
         plot.show()
 
     _core:torch.nn.Parameter
-    @property
-    def _decompression_core(self):
-        if self._convolution_type == 'fourier':
-            return torch.fft.ifft2(1.0 / torch.fft.fftshift(torch.fft.fft2(self._core)))
-        elif self._convolution_type == 'convolution':
-            raise Exception('На данный момент существующий алгоритм пиздец какой сложный https://www.notion.so/4da066e852174b1b94401e818a973bd4?pvs=4#076f6fbba3c6415684149472f0860cb4')
+    _decompression_core:torch.nn.Parameter
+    # @property
+    # def _decompression_core(self):
+    #     if self._convolution_type == 'fourier':
+    #         return torch.fft.ifft2(1.0 / torch.fft.fftshift(torch.fft.fft2(self._core)))
+    #     elif self._convolution_type == 'convolution':
+    #         raise Exception('На данный момент существующий алгоритм пиздец какой сложный https://www.notion.so/4da066e852174b1b94401e818a973bd4?pvs=4#076f6fbba3c6415684149472f0860cb4')
     @property
     def core(self):
         class Selector:
@@ -224,31 +234,134 @@ class ConvolutionalCompression(torch.nn.Module):
     def forward(self, data:torch.Tensor):
         return self.decompress(self.compress(data))
 
-    def _epoch(self, loss_function:Callable):
-        for batch, (images, labels) in enumerate(CycleTimePredictor(self._data_train)):
+    @staticmethod
+    def _normalize(data:torch.Tensor):
+        min_val = data.min(-1)[0].min(-1)[0]
+        max_val = data.max(-1)[0].max(-1)[0]
+        return (data - min_val[:, :, None, None]) / (max_val[:, :, None, None] - min_val[:, :, None, None])
+
+    @staticmethod
+    def border_normalization(a:torch.Tensor):
+        return
+
+    @staticmethod
+    def mean_square_deviation(a:torch.Tensor, b:torch.Tensor):
+        return torch.sqrt(torch.mean((a - b)**2) / (a.numel() - 1))
+    @staticmethod
+    def mean_square_deviation_relative(a:torch.Tensor, b:torch.Tensor):
+        return torch.sqrt(torch.mean(((a - b)/(a + 1.0))**2) / (a.numel() - 1))
+    @staticmethod
+    def max_deviation(a:torch.Tensor, b:torch.Tensor):
+        return ((a-b)**2).max(-1)[0].max(-1)[0]
+    @staticmethod
+    def max_deviation_relative(a:torch.Tensor, b:torch.Tensor):
+        return (((a - b)/(a + 1.0)) ** 2).max(-1)[0].max(-1)[0]
+    @staticmethod
+    def reverse_peak_signal_to_noise_ration(a:torch.Tensor, b:torch.Tensor):
+        return 1.0 / (10 * torch.log10(1.0 / torch.nn.functional.mse_loss(a, b) + 1.0))
+
+    def _epoch(self, comparison_function:Callable, loss_function:Callable, optimizer:torch.optim.Optimizer):
+        loss_buffer_size = 10
+        loss_buffer_position = 0
+        loss_buffer = [0 for i in range(loss_buffer_size)]
+        def show_loss():
+            return f'Текущий лосс: {Format.Scientific(loss_buffer[loss_buffer_position], "", 2)}'
+        def show_average_loss():
+            return f'Средний лосс за {loss_buffer_size} операций: {Format.Scientific(sum(loss_buffer)/loss_buffer_size, "", 2)}'
+
+        for batch, (images, labels) in enumerate(CycleTimePredictor(self._data_train, [show_loss, show_average_loss])):
             if not isinstance(images, torch.Tensor):
                 raise Exception
+            images = images.to(self.device)
             decompressed = self.forward(images)
+            images = images.abs()
+            decompressed = decompressed.abs()
+            deviations = comparison_function(images, decompressed)
+            loss = loss_function(deviations)
+
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+            # prev_loss = loss_buffer[loss_buffer_position]
+            loss_buffer_position = loss_buffer_position + 1 if loss_buffer_position < loss_buffer_size - 1 else 0
+            loss_buffer[loss_buffer_position] = loss.item()
+            # curr_loss = loss_buffer[loss_buffer_position]
+
+            # if curr_loss > prev_loss:
+            #     for param_group in optimizer.param_groups:
+            #         param_group['lr'] *= 0.5
+            # else:
+            #     for param_group in optimizer.param_groups:
+            #         param_group['lr'] *= 1.1
 
 
-        pass
-    def _accuracy(self):
-        pass
-    def train(self, epochs:int=1, loss_function:Union[Callable,Literal['MSE']]= 'MSE'):
+    def _accuracy(self, comparison_function:Callable, loss_function:Callable):
+        with torch.no_grad():
+            average_loss = 0.0
+            counter:int = 0
+            def show_average_loss():
+                return f'Средний лосс: {Format.Scientific(average_loss / (counter if counter > 0 else 1), "", 2)}'
+            for batch, (images, labels) in enumerate(CycleTimePredictor(self._data_test, [show_average_loss])):
+                if not isinstance(images, torch.Tensor):
+                    raise Exception
+                images = images.to(self.device)
+                decompressed = self.forward(images)
+                # images = self._normalize(images.abs())
+                # decompressed = self._normalize(decompressed.abs())
+                images = images.abs()
+                decompressed = decompressed.abs()
+                deviations = comparison_function(images, decompressed)
+                loss = loss_function(deviations)
+
+                average_loss += loss.item()
+                counter += 1
+    def optimize(self, epochs:int=1, loss_function:Union[Callable,Literal['Mean']]='Mean', comparison_function:Union[Callable,Literal['MSD', 'MSDR', 'Max', 'MaxR', 'RPSNR']]='MSD', optimizer:type(torch.optim.Optimizer)=None, **optimizer_kwargs):
         if isinstance(loss_function, str):
-            if loss_function == 'MSE':
-                loss_function = torch.nn.MSELoss()
+            if loss_function == 'Mean':
+                loss_function = torch.mean
             else:
-                loss_function = torch.nn.MSELoss()
+                loss_function = torch.mean
+        if isinstance(comparison_function, str):
+            if comparison_function == 'MSD':
+                comparison_function = self.mean_square_deviation
+            elif comparison_function == 'NSDR':
+                comparison_function = self.mean_square_deviation_relative
+            elif comparison_function == 'Max':
+                comparison_function = self.max_deviation
+            elif comparison_function == 'MaxR':
+                comparison_function = self.max_deviation_relative
+            elif comparison_function == 'RPSNR':
+                comparison_function = self.reverse_peak_signal_to_noise_ration
+            else:
+                comparison_function = self.mean_square_deviation
+        if optimizer is None:
+            optimizer = torch.optim.Adam
+            optimizer_kwargs = {
+                'lr': 0.01,
+            }
+        optimizer = optimizer(params=self.parameters(), **optimizer_kwargs)
+
+        self._accuracy(comparison_function, loss_function)
         for epoch in range(epochs):
             self.train()
-            self._epoch(loss_function)
+            self._epoch(comparison_function, loss_function, optimizer)
             self.eval()
-            self._accuracy()
+            self._accuracy(comparison_function, loss_function)
 
 
 if __name__ == '__main__':
-
-    Compressor = ConvolutionalCompression('Flowers', size=255, compression=0.95, convolution='fourier', core_ratio=1.0, core_type='combat')
+    Compressor = ConvolutionalCompression('Flowers', batch=404, size=511, compression=0.1, core_ratio=1.0, core_type='phase')
     Compressor.test()
+
+    rate = 0.01
+    while True:
+        print(f'Rate: {Format.Scientific(rate, "", 2)}')
+        Compressor.optimize(optimizer=torch.optim.Adam, lr=rate, amsgrad=True, epochs=3, comparison_function='MSD')
+        Compressor.test()
+        Compressor.optimize(optimizer=torch.optim.Adam, lr=rate, amsgrad=True, epochs=3, comparison_function='MSD')
+        Compressor.test()
+        Compressor.optimize(optimizer=torch.optim.Adam, lr=rate, amsgrad=True, epochs=3, comparison_function='MSD')
+        Compressor.test()
+        rate /= 2
 
