@@ -523,6 +523,11 @@ def rate_test():
 def train():
     compressor = ConvolutionalCompression('Flowers', batch=64, size=511, compression=0.9, core_ratio=1.0)
     compressor.test()
+    compression_group = {'params': compressor.params.compression, 'lr':0.01}
+    decompression_group = {'params': compressor.params.decompression, 'lr':0.01}
+    optimizer = torch.optim.Adam([compression_group, decompression_group])
+    information = compressor.optimize(optimizer, epochs=1, comparison_function='RSCC')
+    information.plot(compressor.get_images(3))
 
 if __name__ == '__main__':
     # rate_test()
