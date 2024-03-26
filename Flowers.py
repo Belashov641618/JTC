@@ -1,12 +1,9 @@
 import copy
-import random
-
-import matplotlib.pyplot
 import torch
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader
 from torchvision import datasets, transforms
 
-from typing import Union, Type, Literal, Optional, Tuple, Callable
+from typing import Union, Literal, Optional, Tuple, Callable
 
 from CycleTimePredictor import CycleTimePredictor
 from belashovplot import TiledPlot
@@ -35,7 +32,6 @@ class ConvolutionalCompression(torch.nn.Module):
     _data_train : DataLoader
     _data_test  : DataLoader
     def get_images(self, count:int, test:bool=True):
-        data = None
         if test:    data = self._data_test
         else:       data = self._data_train
         data = iter(data)
@@ -141,8 +137,8 @@ class ConvolutionalCompression(torch.nn.Module):
         a = ConvolutionalCompression.fix_shape(a)
         b = ConvolutionalCompression.fix_shape(b)
 
-        a_paddings = [0 for i in range(4)]
-        b_paddings = [0 for i in range(4)]
+        a_paddings = [0 for _ in range(4)]
+        b_paddings = [0 for _ in range(4)]
 
         for i in range(2):
             n = i + 2
@@ -310,6 +306,14 @@ class ConvolutionalCompression(torch.nn.Module):
         return (1.0 - torch.sum(a*b,dim=(2,3)) / torch.sqrt(torch.sum(a*a, dim=(2,3))*torch.sum(b*b, dim=(2,3))))**2
 
     _accuracy:Optional[float]
+    def _iter(self, images:torch.Tensor, comparison_function:Callable, loss_function:Callable):
+        images = images.to(self.device)
+        decompressed = self.forward(images)
+        images = images.abs()
+        decompressed = decompressed.abs()
+        deviations = comparison_function(images, decompressed)
+        loss = loss_function(deviations)
+        return loss
     def _epoch(self, comparison_function:Callable, loss_function:Callable, optimizer:torch.optim.Optimizer):
         self._accuracy = None
 
@@ -317,7 +321,7 @@ class ConvolutionalCompression(torch.nn.Module):
 
         loss_buffer_size = 10
         loss_buffer_position = 0
-        loss_buffer = [0 for i in range(loss_buffer_size)]
+        loss_buffer = [0 for _ in range(loss_buffer_size)]
         def show_loss():
             return f'Текущий лосс: {Format.Scientific(loss_buffer[loss_buffer_position], "", 2)}'
         def show_average_loss():
@@ -326,13 +330,8 @@ class ConvolutionalCompression(torch.nn.Module):
         self.train()
         for batch, (images, labels) in enumerate(CycleTimePredictor(self._data_train, [show_loss, show_average_loss])):
             if not isinstance(images, torch.Tensor):
-                raise Exception
-            images = images.to(self.device)
-            decompressed = self.forward(images)
-            images = images.abs()
-            decompressed = decompressed.abs()
-            deviations = comparison_function(images, decompressed)
-            loss = loss_function(deviations)
+                raise TypeError
+            loss = self._iter(images, comparison_function, loss_function)
 
             optimizer.zero_grad()
             loss.backward()
@@ -354,13 +353,8 @@ class ConvolutionalCompression(torch.nn.Module):
                     return f'Средний лосс: {Format.Scientific(average_loss / (counter if counter > 0 else 1), "", 2)}'
                 for batch, (images, labels) in enumerate(CycleTimePredictor(self._data_test, [show_average_loss])):
                     if not isinstance(images, torch.Tensor):
-                        raise Exception
-                    images = images.to(self.device)
-                    decompressed = self.forward(images)
-                    images = images.abs()
-                    decompressed = decompressed.abs()
-                    deviations = comparison_function(images, decompressed)
-                    loss = loss_function(deviations)
+                        raise TypeError
+                    loss = self._iter(images, comparison_function, loss_function)
 
                     average_loss += loss.item()
                     counter += 1
@@ -397,6 +391,9 @@ class ConvolutionalCompression(torch.nn.Module):
             optimization_info.append(loss_history, accuracy, self)
 
         return optimization_info
+
+    def get_accuracy(self):
+        return self._accuracy
 
 class OptimizationHistory:
     _epochs_loss_histories:list[numpy.ndarray]
@@ -458,9 +455,9 @@ class OptimizationHistory:
         def image_function(image_:torch.Tensor):
             return torch.abs(image_).squeeze().cpu()
 
-        def add_image(image_:torch.Tensor, col:int, row:int):
-            axes = plot.axes.add(col, row)
-            axes.imshow(image_function(image_), **image_params)
+        def add_image(image_:torch.Tensor, col_:int, row_:int):
+            axes_ = plot.axes.add(col_, row_)
+            axes_.imshow(image_function(image_), **image_params)
 
         colors = ['maroon', 'darkorange', 'darkgreen', 'darkslategrey', 'darkblue', 'darkslateblue', 'darkviolet', 'darkmagenta']*(self.length//8 + 1)
         axes = plot.axes.add((1, 0), (self.length, 0))
@@ -483,7 +480,8 @@ class OptimizationHistory:
         plot.graph.label.y('Точность')
 
         for row, image in enumerate(images, start=1):
-            add_image(image, 0, row)
+            if isinstance(image, torch.Tensor):
+                add_image(image, 0, row)
             plot.description.row.left(f"Пример №{row}", row)
         row_cc = 1 + len(images)
         row_dc = row_cc + 1
@@ -502,24 +500,31 @@ class OptimizationHistory:
 
         plot.show()
 
-if __name__ == '__main__':
-    # Compressor = ConvolutionalCompression('Flowers', batch=404, size=511, compression=0.1, core_ratio=1.0, core_type='phase')
-    # Compressor.test()
-
-    compression_core_rates =    numpy.logspace(0, -9, 10, base=10)
-    decompression_core_rates =  numpy.logspace(0, -9, 10, base=10)
+def rate_test():
+    compression_core_rates = numpy.logspace(0, -9, 10, base=10)
+    decompression_core_rates = numpy.logspace(0, -9, 10, base=10)
 
     accuracies = []
 
-    for (n, compression_core_rate), (m, decompression_core_rate) in product(enumerate(compression_core_rates), enumerate(decompression_core_rates)):
+    for (n, compression_core_rate), (m, decompression_core_rate) in product(enumerate(compression_core_rates),
+                                                                            enumerate(decompression_core_rates)):
         compressor = ConvolutionalCompression('Flowers', batch=404, size=511, compression=0.1)
-        compression_group   = {'params':compressor.params.compression,   'lr':compression_core_rate}
-        decompression_group = {'params':compressor.params.decompression, 'lr':decompression_core_rate}
+        compression_group = {'params': compressor.params.compression, 'lr': compression_core_rate}
+        decompression_group = {'params': compressor.params.decompression, 'lr': decompression_core_rate}
         optimizer = torch.optim.Adam([compression_group, decompression_group])
 
         info = compressor.optimize(optimizer, epochs=10, comparison_function='RSCC')
         info.plot(compressor.get_images(3), f"Скорость обучения ядра шифровки: {Format.Scientific(compression_core_rate, '', 3)}\nСкорость обучения ядра дешифровки: {Format.Scientific(decompression_core_rate, '', 3)}")
 
-        accuracies.append(compressor._accuracy)
+        accuracies.append(compressor.get_accuracy())
 
     print(accuracies)
+
+def train():
+    compressor = ConvolutionalCompression('Flowers', batch=64, size=511, compression=0.9, core_ratio=1.0)
+    compressor.test()
+
+if __name__ == '__main__':
+    # rate_test()
+    train()
+
