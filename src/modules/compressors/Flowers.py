@@ -5,11 +5,11 @@ from torchvision import datasets, transforms
 
 from typing import Union, Literal, Optional, Tuple, Callable
 
-from CycleTimePredictor import CycleTimePredictor
+from src.utilities.CycleTimePredictor import CycleTimePredictor
 from belashovplot import TiledPlot
 from math import sqrt
 from itertools import product
-from Formaters import Format
+from src.utilities.Formaters import Format
 import numpy
 
 def plot_batch(batch:torch.Tensor, name:str, ratio:float=16/9):
@@ -27,6 +27,10 @@ def plot_batch(batch:torch.Tensor, name:str, ratio:float=16/9):
         axes.imshow(image, aspect='auto', cmap='gray')
 
     plot.show()
+
+class ComparisonFunctions:
+    def __call__(self, a:torch.Tensor, b:torch.Tensor):
+        return
 
 class ConvolutionalCompression(torch.nn.Module):
     _data_train : DataLoader
